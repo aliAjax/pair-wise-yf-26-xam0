@@ -26,7 +26,12 @@ python3 -m unittest -v
 - `POST /api/versions/{id}/copies`：创建独立副本内容。
 - `POST /api/copies/{id}/verify`：校验副本；发现损坏时从健康副本修复。
 - `POST /api/copies/{id}/simulate-corruption`：演示/测试介质损坏，仅 owner 或 archivist 可用。
-- `POST /api/versions/{id}/migrate`：生成格式迁移后的新版本并保留派生关系。
+- `POST /api/versions/{id}/migrate`：提交一个文件的格式转换，归入同一迁移批次。
+- `GET /api/migrations/{id}`：查看迁移批次进度与逐文件记录。
+- `POST /api/migrations/{id}/recheck`：源版本改动检测，摘要不一致则批次失效。
+- `POST /api/migrations/{id}/confirm`：失效后重新确认并继续迁移。
 - `GET /api/archives/{id}/status`：保留期限、版本状态和审计记录。
+
+迁移以批次为单位：同一 `(源版本, 目标格式)` 只登记一个批次，第一个提交者登记后继续，后到者看到进度（`already_registered=true`）并并入同一批次，不另起版本。批次在**全部文件迁完、逐份校验通过、且目标版本建有覆盖全部文件的健康副本**后才置为 `complete`；否则停在 `in_progress`，目标版本状态为 `in_progress`，源版本原件仍按原件读回。中途失败后重试只补做未完成的文件，已完成且源未变的记录不重复写。源版本后来改动时，`recheck` 会把批次置为 `invalidated`，需 `confirm` 重新确认后再迁移受影响文件。没有迁移记录的旧版本按未迁移处理，仍可正常查看和校验。
 
 档案路径拒绝绝对路径和 `..`；同一版本副本位置唯一；没有健康副本时版本标记为 `degraded`；所有变更写入审计日志。

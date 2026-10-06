@@ -95,7 +95,7 @@ class PreservationStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     archive_id INTEGER NOT NULL REFERENCES archives(id),
                     version INTEGER NOT NULL,
-                    state TEXT NOT NULL DEFAULT 'verified' CHECK(state IN ('verified','degraded')),
+                    state TEXT NOT NULL DEFAULT 'verified' CHECK(state IN ('verified','degraded','in_progress','invalidated')),
                     created_by TEXT NOT NULL REFERENCES users(id),
                     created_at TEXT NOT NULL,
                     UNIQUE(archive_id,version)
@@ -126,15 +126,33 @@ class PreservationStore:
                     content BLOB NOT NULL,
                     PRIMARY KEY(copy_id,path)
                 );
-                CREATE TABLE IF NOT EXISTS migrations(
+                CREATE TABLE IF NOT EXISTS migration_batches(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     source_version_id INTEGER NOT NULL REFERENCES archive_versions(id),
                     target_version_id INTEGER NOT NULL UNIQUE REFERENCES archive_versions(id),
+                    target_format TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'in_progress' CHECK(state IN ('in_progress','complete','invalidated')),
+                    source_digest TEXT NOT NULL,
+                    actor_id TEXT NOT NULL REFERENCES users(id),
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    UNIQUE(source_version_id, target_format)
+                );
+                CREATE TABLE IF NOT EXISTS migrations(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id INTEGER NOT NULL REFERENCES migration_batches(id),
+                    source_version_id INTEGER NOT NULL REFERENCES archive_versions(id),
+                    target_version_id INTEGER NOT NULL REFERENCES archive_versions(id),
                     source_path TEXT NOT NULL,
                     target_path TEXT NOT NULL,
                     target_format TEXT NOT NULL,
+                    source_sha256 TEXT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    size INTEGER NOT NULL,
                     actor_id TEXT NOT NULL REFERENCES users(id),
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    UNIQUE(batch_id, source_path),
+                    UNIQUE(batch_id, target_path)
                 );
                 CREATE TABLE IF NOT EXISTS audit_log(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -285,6 +303,11 @@ class PreservationStore:
                        SELECT ?,path,sha256,size,content FROM archive_files WHERE version_id=?""",
                     (copy_id, version_id),
                 )
+                batch = conn.execute(
+                    "SELECT * FROM migration_batches WHERE target_version_id=?", (version_id,)
+                ).fetchone()
+                if batch and batch["state"] in ("in_progress", "complete"):
+                    self._recompute_batch(conn, batch["id"])
                 self._audit(conn, version["archive_id"], actor_id, "copy.create", {"copy_id": copy_id, "version_id": version_id, "location": location})
                 return {"id": copy_id, "version_id": version_id, "location": location, "state": "healthy"}
             except sqlite3.IntegrityError:
@@ -308,7 +331,19 @@ class PreservationStore:
                 "SELECT id,location,state,last_verified_at FROM copies WHERE version_id=? ORDER BY id", (version_id,)
             ).fetchall()
             archive = conn.execute("SELECT * FROM archives WHERE id=?", (version["archive_id"],)).fetchone()
-            return {"version": dict(version), "archive": dict(archive), "files": [dict(x) for x in files], "copies": [dict(x) for x in copies]}
+            result = {"version": dict(version), "archive": dict(archive), "files": [dict(x) for x in files], "copies": [dict(x) for x in copies]}
+            migration = conn.execute(
+                "SELECT * FROM migration_batches WHERE target_version_id=?", (version_id,)
+            ).fetchone()
+            if migration:
+                result["migration"] = self._batch_progress(conn, migration)
+            outgoing = conn.execute(
+                "SELECT id,target_version_id,target_format,state,created_at,completed_at FROM migration_batches WHERE source_version_id=? ORDER BY id",
+                (version_id,),
+            ).fetchall()
+            if outgoing:
+                result["outgoing_migrations"] = [dict(x) for x in outgoing]
+            return result
 
     def verify_copy(self, user_id: str, copy_id: int) -> dict:
         with self.connect() as conn:
@@ -383,7 +418,106 @@ class PreservationStore:
             self._audit(conn, version["archive_id"], user_id, "copy.simulate_corruption", {"copy_id": copy_id, "path": path})
             return {"copy_id": copy_id, "path": path, "state": "corrupt"}
 
+    @staticmethod
+    def _digest_path_sha(files: list) -> str:
+        h = hashlib.sha256()
+        for f in sorted(files, key=lambda x: x["path"]):
+            h.update(f["path"].encode("utf-8"))
+            h.update(f["sha256"].encode("ascii"))
+        return h.hexdigest()
+
+    def _source_digest(self, conn, version_id: int) -> str:
+        files = conn.execute(
+            "SELECT path,sha256 FROM archive_files WHERE version_id=? ORDER BY path", (version_id,)
+        ).fetchall()
+        return self._digest_path_sha(files)
+
+    def _batch_progress(self, conn, batch: sqlite3.Row) -> dict:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM archive_files WHERE version_id=?", (batch["source_version_id"],)
+        ).fetchone()[0]
+        done = conn.execute(
+            "SELECT COUNT(*) FROM migrations WHERE batch_id=?", (batch["id"],)
+        ).fetchone()[0]
+        return {
+            "batch_id": batch["id"],
+            "source_version_id": batch["source_version_id"],
+            "target_version_id": batch["target_version_id"],
+            "target_format": batch["target_format"],
+            "state": batch["state"],
+            "files_done": done,
+            "files_total": total,
+            "created_at": batch["created_at"],
+            "completed_at": batch["completed_at"],
+        }
+
+    def _copy_covers_all(self, conn, copy_id: int, version_id: int) -> bool:
+        targets = conn.execute(
+            "SELECT path,sha256,size FROM archive_files WHERE version_id=?", (version_id,)
+        ).fetchall()
+        if not targets:
+            return False
+        rows = conn.execute(
+            "SELECT path,sha256,size FROM copy_files WHERE copy_id=?", (copy_id,)
+        ).fetchall()
+        if len(rows) != len(targets):
+            return False
+        tmap = {r["path"]: r for r in targets}
+        for r in rows:
+            t = tmap.get(r["path"])
+            if t is None or r["sha256"] != t["sha256"] or r["size"] != t["size"]:
+                return False
+        return True
+
+    def _recompute_batch(self, conn, batch_id: int) -> dict:
+        batch = conn.execute("SELECT * FROM migration_batches WHERE id=?", (batch_id,)).fetchone()
+        if not batch:
+            raise BusinessError("迁移批次不存在", 404, "batch_not_found")
+        progress = self._batch_progress(conn, batch)
+        complete = progress["files_total"] > 0 and progress["files_done"] == progress["files_total"]
+        if complete:
+            items = conn.execute(
+                "SELECT target_path,sha256 FROM migrations WHERE batch_id=?", (batch_id,)
+            ).fetchall()
+            for it in items:
+                tf = conn.execute(
+                    "SELECT sha256 FROM archive_files WHERE version_id=? AND path=?",
+                    (batch["target_version_id"], it["target_path"]),
+                ).fetchone()
+                if tf is None or tf["sha256"] != it["sha256"]:
+                    complete = False
+                    break
+        if complete:
+            healthy = conn.execute(
+                "SELECT id FROM copies WHERE version_id=? AND state='healthy'", (batch["target_version_id"],)
+            ).fetchall()
+            if not any(self._copy_covers_all(conn, c["id"], batch["target_version_id"]) for c in healthy):
+                complete = False
+        if batch["state"] == "invalidated":
+            return self._batch_progress(conn, batch)
+        new_state = "complete" if complete else "in_progress"
+        if batch["state"] != new_state:
+            if new_state == "complete":
+                conn.execute(
+                    "UPDATE migration_batches SET state='complete', completed_at=? WHERE id=?", (now(), batch_id)
+                )
+                conn.execute("UPDATE archive_versions SET state='verified' WHERE id=?", (batch["target_version_id"],))
+            else:
+                conn.execute(
+                    "UPDATE migration_batches SET state='in_progress', completed_at=NULL WHERE id=?", (batch_id,)
+                )
+                conn.execute(
+                    "UPDATE archive_versions SET state='in_progress' WHERE id=?", (batch["target_version_id"],)
+                )
+        return self._batch_progress(
+            conn, conn.execute("SELECT * FROM migration_batches WHERE id=?", (batch_id,)).fetchone()
+        )
+
     def migrate(self, actor_id: str, version_id: int, source_path: str, target_path: str, target_format: str, content_b64: str) -> dict:
+        converted = verify_manifest([{"path": target_path, "content_b64": content_b64}])[0]
+        target_format = target_format.strip()
+        if not target_format:
+            raise BusinessError("target_format 不能为空", 422, "invalid_format")
         with self.connect() as conn:
             actor = self._user(conn, actor_id, {"owner", "archivist"})
             source_version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (version_id,)).fetchone()
@@ -395,37 +529,88 @@ class PreservationStore:
             ).fetchone()
             if not source:
                 raise BusinessError("源文件不存在", 404, "source_not_found")
-            converted = verify_manifest([{"path": target_path, "content_b64": content_b64}])[0]
             try:
                 conn.execute("BEGIN IMMEDIATE")
-                version_no = conn.execute(
-                    "SELECT COALESCE(MAX(version),0)+1 FROM archive_versions WHERE archive_id=?", (source_version["archive_id"],)
-                ).fetchone()[0]
-                cur = conn.execute(
-                    "INSERT INTO archive_versions(archive_id,version,created_by,created_at) VALUES(?,?,?,?)",
-                    (source_version["archive_id"], version_no, actor_id, now()),
-                )
-                target_version_id = cur.lastrowid
-                conn.execute(
-                    """INSERT INTO archive_files(version_id,path,sha256,size,content)
-                       SELECT ?,path,sha256,size,content FROM archive_files
-                       WHERE version_id=? AND path<>?""",
-                    (target_version_id, version_id, source_path),
-                )
-                conn.execute(
-                    "INSERT INTO archive_files(version_id,path,sha256,size,content) VALUES(?,?,?,?,?)",
-                    (target_version_id, converted["path"], converted["sha256"], converted["size"], converted["content"]),
-                )
-                conn.execute(
-                    "INSERT INTO migrations(source_version_id,target_version_id,source_path,target_path,target_format,actor_id,created_at) VALUES(?,?,?,?,?,?,?)",
-                    (version_id, target_version_id, source_path, converted["path"], target_format.strip(), actor_id, now()),
-                )
+                batch = conn.execute(
+                    "SELECT * FROM migration_batches WHERE source_version_id=? AND target_format=?",
+                    (version_id, target_format),
+                ).fetchone()
+                already_registered = batch is not None
+                if batch is None:
+                    version_no = conn.execute(
+                        "SELECT COALESCE(MAX(version),0)+1 FROM archive_versions WHERE archive_id=?",
+                        (source_version["archive_id"],),
+                    ).fetchone()[0]
+                    cur = conn.execute(
+                        "INSERT INTO archive_versions(archive_id,version,state,created_by,created_at) VALUES(?,?,?,?,?)",
+                        (source_version["archive_id"], version_no, "in_progress", actor_id, now()),
+                    )
+                    target_version_id = cur.lastrowid
+                    cur = conn.execute(
+                        """INSERT INTO migration_batches(source_version_id,target_version_id,target_format,state,source_digest,actor_id,created_at)
+                           VALUES(?,?,?,?,?,?,?)""",
+                        (version_id, target_version_id, target_format, "in_progress",
+                         self._source_digest(conn, version_id), actor_id, now()),
+                    )
+                    batch_id = cur.lastrowid
+                    batch = conn.execute("SELECT * FROM migration_batches WHERE id=?", (batch_id,)).fetchone()
+                else:
+                    if batch["state"] == "invalidated":
+                        raise BusinessError("迁移已失效，请先重新确认", 409, "migration_invalidated")
+                    if batch["state"] == "complete":
+                        raise BusinessError("该版本迁移已完成", 409, "migration_complete")
+                    target_version_id = batch["target_version_id"]
+                existing = conn.execute(
+                    "SELECT * FROM migrations WHERE batch_id=? AND source_path=?", (batch["id"], source_path)
+                ).fetchone()
+                if existing and existing["source_sha256"] == source["sha256"]:
+                    pass
+                elif existing:
+                    conn.execute(
+                        "UPDATE migrations SET target_path=?, source_sha256=?, sha256=?, size=? WHERE id=?",
+                        (converted["path"], source["sha256"], converted["sha256"], converted["size"], existing["id"]),
+                    )
+                    conn.execute(
+                        "DELETE FROM archive_files WHERE version_id=? AND path=?",
+                        (target_version_id, existing["target_path"]),
+                    )
+                    conn.execute(
+                        "INSERT INTO archive_files(version_id,path,sha256,size,content) VALUES(?,?,?,?,?)",
+                        (target_version_id, converted["path"], converted["sha256"], converted["size"], converted["content"]),
+                    )
+                else:
+                    conn.execute(
+                        """INSERT INTO migrations(batch_id,source_version_id,target_version_id,source_path,target_path,target_format,source_sha256,sha256,size,actor_id,created_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                        (batch["id"], version_id, target_version_id, source_path, converted["path"], target_format,
+                         source["sha256"], converted["sha256"], converted["size"], actor_id, now()),
+                    )
+                    conn.execute(
+                        "INSERT INTO archive_files(version_id,path,sha256,size,content) VALUES(?,?,?,?,?)",
+                        (target_version_id, converted["path"], converted["sha256"], converted["size"], converted["content"]),
+                    )
+                progress = self._recompute_batch(conn, batch["id"])
+                target_version = conn.execute(
+                    "SELECT version FROM archive_versions WHERE id=?", (target_version_id,)
+                ).fetchone()
                 self._audit(
                     conn, source_version["archive_id"], actor_id, "format.migrate",
-                    {"source_version_id": version_id, "target_version_id": target_version_id,
-                     "source_path": source_path, "target_path": converted["path"], "target_format": target_format.strip()},
+                    {"batch_id": batch["id"], "source_version_id": version_id, "target_version_id": target_version_id,
+                     "source_path": source_path, "target_path": converted["path"], "target_format": target_format,
+                     "state": progress["state"], "files_done": progress["files_done"], "files_total": progress["files_total"]},
                 )
-                return {"id": target_version_id, "version": version_no, "source_version_id": version_id, "target_path": converted["path"]}
+                return {
+                    "id": target_version_id,
+                    "version": target_version["version"],
+                    "batch_id": batch["id"],
+                    "source_version_id": version_id,
+                    "target_path": converted["path"],
+                    "target_format": target_format,
+                    "state": progress["state"],
+                    "files_done": progress["files_done"],
+                    "files_total": progress["files_total"],
+                    "already_registered": already_registered,
+                }
             except Exception:
                 conn.rollback()
                 raise
@@ -437,13 +622,115 @@ class PreservationStore:
             archive = conn.execute("SELECT * FROM archives WHERE id=?", (archive_id,)).fetchone()
             versions = conn.execute("SELECT id,version,state,created_at FROM archive_versions WHERE archive_id=? ORDER BY version", (archive_id,)).fetchall()
             deadline = date.fromisoformat(archive["retention_until"])
+            version_list = []
+            for v in versions:
+                d = dict(v)
+                d["file_count"] = conn.execute("SELECT COUNT(*) FROM archive_files WHERE version_id=?", (v["id"],)).fetchone()[0]
+                d["copy_count"] = conn.execute("SELECT COUNT(*) FROM copies WHERE version_id=?", (v["id"],)).fetchone()[0]
+                mig = conn.execute(
+                    "SELECT id,target_format,state FROM migration_batches WHERE target_version_id=?", (v["id"],)
+                ).fetchone()
+                if mig:
+                    d["migration"] = {"batch_id": mig["id"], "target_format": mig["target_format"], "state": mig["state"]}
+                version_list.append(d)
             return {
                 "archive": dict(archive),
                 "days_remaining": (deadline - date.today()).days,
-                "versions": [dict(v) | {"file_count": conn.execute("SELECT COUNT(*) FROM archive_files WHERE version_id=?", (v["id"],)).fetchone()[0],
-                                         "copy_count": conn.execute("SELECT COUNT(*) FROM copies WHERE version_id=?", (v["id"],)).fetchone()[0]}
-                             for v in versions],
+                "versions": version_list,
                 "audit": [dict(r) | {"detail": json.loads(r["detail"])} for r in conn.execute("SELECT * FROM audit_log WHERE archive_id=? ORDER BY id", (archive_id,)).fetchall()],
+            }
+
+    def get_migration(self, user_id: str, batch_id: int) -> dict:
+        with self.connect() as conn:
+            user = self._user(conn, user_id, {"owner", "archivist", "auditor"})
+            batch = conn.execute("SELECT * FROM migration_batches WHERE id=?", (batch_id,)).fetchone()
+            if not batch:
+                raise BusinessError("迁移批次不存在", 404, "batch_not_found")
+            source_version = conn.execute(
+                "SELECT archive_id FROM archive_versions WHERE id=?", (batch["source_version_id"],)
+            ).fetchone()
+            self._access(conn, source_version["archive_id"], user)
+            progress = self._batch_progress(conn, batch)
+            items = conn.execute(
+                "SELECT source_path,target_path,target_format,sha256,size,actor_id,created_at FROM migrations WHERE batch_id=? ORDER BY id",
+                (batch_id,),
+            ).fetchall()
+            progress["files"] = [dict(x) for x in items]
+            return progress
+
+    def recheck_migration(self, user_id: str, batch_id: int) -> dict:
+        with self.connect() as conn:
+            user = self._user(conn, user_id, {"owner", "archivist", "auditor"})
+            batch = conn.execute("SELECT * FROM migration_batches WHERE id=?", (batch_id,)).fetchone()
+            if not batch:
+                raise BusinessError("迁移批次不存在", 404, "batch_not_found")
+            source_version = conn.execute(
+                "SELECT archive_id FROM archive_versions WHERE id=?", (batch["source_version_id"],)
+            ).fetchone()
+            self._access(conn, source_version["archive_id"], user)
+            current_digest = self._source_digest(conn, batch["source_version_id"])
+            invalidated = current_digest != batch["source_digest"]
+            if invalidated and batch["state"] != "invalidated":
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    conn.execute("UPDATE migration_batches SET state='invalidated' WHERE id=?", (batch_id,))
+                    conn.execute("UPDATE archive_versions SET state='invalidated' WHERE id=?", (batch["target_version_id"],))
+                    self._audit(
+                        conn, source_version["archive_id"], user_id, "format.migration_invalidated",
+                        {"batch_id": batch_id, "source_version_id": batch["source_version_id"],
+                         "recorded_digest": batch["source_digest"], "current_digest": current_digest},
+                    )
+                except Exception:
+                    conn.rollback()
+                    raise
+            progress = self._batch_progress(
+                conn, conn.execute("SELECT * FROM migration_batches WHERE id=?", (batch_id,)).fetchone()
+            )
+            return {
+                "batch_id": batch_id,
+                "state": progress["state"],
+                "invalidated": invalidated,
+                "recorded_digest": batch["source_digest"],
+                "current_digest": current_digest,
+                "files_done": progress["files_done"],
+                "files_total": progress["files_total"],
+            }
+
+    def confirm_migration(self, actor_id: str, batch_id: int) -> dict:
+        with self.connect() as conn:
+            actor = self._user(conn, actor_id, {"owner", "archivist"})
+            batch = conn.execute("SELECT * FROM migration_batches WHERE id=?", (batch_id,)).fetchone()
+            if not batch:
+                raise BusinessError("迁移批次不存在", 404, "batch_not_found")
+            source_version = conn.execute(
+                "SELECT archive_id FROM archive_versions WHERE id=?", (batch["source_version_id"],)
+            ).fetchone()
+            self._access(conn, source_version["archive_id"], actor, require_write=True)
+            if batch["state"] != "invalidated":
+                raise BusinessError("只有失效的迁移需要重新确认", 409, "not_invalidated")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                new_digest = self._source_digest(conn, batch["source_version_id"])
+                conn.execute(
+                    "UPDATE migration_batches SET state='in_progress', source_digest=?, completed_at=NULL WHERE id=?",
+                    (new_digest, batch_id),
+                )
+                conn.execute("UPDATE archive_versions SET state='in_progress' WHERE id=?", (batch["target_version_id"],))
+                self._audit(
+                    conn, source_version["archive_id"], actor_id, "format.migration_confirmed",
+                    {"batch_id": batch_id, "source_version_id": batch["source_version_id"], "source_digest": new_digest},
+                )
+            except Exception:
+                conn.rollback()
+                raise
+            progress = self._batch_progress(
+                conn, conn.execute("SELECT * FROM migration_batches WHERE id=?", (batch_id,)).fetchone()
+            )
+            return {
+                "batch_id": batch_id,
+                "state": progress["state"],
+                "files_done": progress["files_done"],
+                "files_total": progress["files_total"],
             }
 
 
@@ -512,6 +799,12 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "copies"] and parts[3] == "simulate-corruption" and method == "POST":
             d = self._body()
             return self._send(200, store.simulate_corruption(user, int(parts[2]), d.get("path", "")))
+        if len(parts) == 3 and parts[:2] == ["api", "migrations"] and method == "GET":
+            return self._send(200, store.get_migration(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "migrations"] and parts[3] == "recheck" and method == "POST":
+            return self._send(200, store.recheck_migration(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "migrations"] and parts[3] == "confirm" and method == "POST":
+            return self._send(200, store.confirm_migration(user, int(parts[2])))
         raise BusinessError("接口不存在", 404, "not_found")
 
     def _handle(self, method: str) -> None:
