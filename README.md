@@ -26,7 +26,12 @@ python3 -m unittest -v
 - `POST /api/versions/{id}/copies`：创建独立副本内容。
 - `POST /api/copies/{id}/verify`：校验副本；发现损坏时从健康副本修复。
 - `POST /api/copies/{id}/simulate-corruption`：演示/测试介质损坏，仅 owner 或 archivist 可用。
-- `POST /api/versions/{id}/migrate`：生成格式迁移后的新版本并保留派生关系。
-- `GET /api/archives/{id}/status`：保留期限、版本状态和审计记录。
+- `POST /api/versions/{id}/migrate`：为源版本登记迁移任务并生成目标版本；同一源版本重复登记时返回已有任务和进度（先登记者继续，后到者确认后协作）。
+- `GET /api/migrations/{id}`：查看迁移任务进度、逐文件记录和副本状态。
+- `POST /api/migrations/{id}/files`：迁移单个文件到目标版本；中途失败重试时已完成的文件跳过、不重复写。
+- `POST /api/migrations/{id}/confirm`：源版本改动导致任务失效后，重新确认并恢复迁移。
+- `GET /api/archives/{id}/status`：保留期限、版本状态（含迁移状态）和审计记录。
 
 档案路径拒绝绝对路径和 `..`；同一版本副本位置唯一；没有健康副本时版本标记为 `degraded`；所有变更写入审计日志。
+
+迁移目标版本在全部文件迁完、副本逐份校验通过且至少建好一个独立副本后才标记为 `complete`，此前保持 `migrating`；迁移中读取目标版本或新建副本时，未迁移的文件按源版本原件读回。源版本降级等改动会使由它迁出的任务失效（`invalidated`），源版本恢复健康副本后需重新确认。没有迁移记录的历史版本一律视为 `unmigrated`，查看与校验不受影响。

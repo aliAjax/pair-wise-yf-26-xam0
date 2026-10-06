@@ -57,6 +57,17 @@ def verify_manifest(files: object) -> list[dict]:
     return result
 
 
+def _version_fingerprint(conn: sqlite3.Connection, version_id: int) -> str:
+    """版本清单指纹：路径、哈希、大小的有序摘要，用于发现源版本改动。"""
+    rows = conn.execute(
+        "SELECT path,sha256,size FROM archive_files WHERE version_id=? ORDER BY path", (version_id,)
+    ).fetchall()
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update(f"{row['path']}\0{row['sha256']}\0{row['size']}\n".encode("utf-8"))
+    return digest.hexdigest()
+
+
 class PreservationStore:
     def __init__(self, db_path: str | Path = DEFAULT_DB):
         self.db_path = str(db_path)
@@ -126,6 +137,7 @@ class PreservationStore:
                     content BLOB NOT NULL,
                     PRIMARY KEY(copy_id,path)
                 );
+                -- 旧版逐文件迁移记录，保留用于历史审计；新迁移流程使用 migration_jobs/migration_records
                 CREATE TABLE IF NOT EXISTS migrations(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     source_version_id INTEGER NOT NULL REFERENCES archive_versions(id),
@@ -135,6 +147,29 @@ class PreservationStore:
                     target_format TEXT NOT NULL,
                     actor_id TEXT NOT NULL REFERENCES users(id),
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS migration_jobs(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    archive_id INTEGER NOT NULL REFERENCES archives(id),
+                    source_version_id INTEGER NOT NULL UNIQUE REFERENCES archive_versions(id),
+                    target_version_id INTEGER NOT NULL UNIQUE REFERENCES archive_versions(id),
+                    source_fingerprint TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'migrating' CHECK(state IN ('migrating','complete','invalidated')),
+                    created_by TEXT NOT NULL REFERENCES users(id),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS migration_records(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id INTEGER NOT NULL REFERENCES migration_jobs(id),
+                    source_path TEXT NOT NULL,
+                    target_path TEXT NOT NULL,
+                    target_format TEXT NOT NULL,
+                    sha256 TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    actor_id TEXT NOT NULL REFERENCES users(id),
+                    created_at TEXT NOT NULL,
+                    UNIQUE(job_id,source_path)
                 );
                 CREATE TABLE IF NOT EXISTS audit_log(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -280,12 +315,25 @@ class PreservationStore:
                     (version_id, location, now(), now()),
                 )
                 copy_id = cur.lastrowid
+                job = conn.execute("SELECT * FROM migration_jobs WHERE target_version_id=?", (version_id,)).fetchone()
                 conn.execute(
                     """INSERT INTO copy_files(copy_id,path,sha256,size,content)
                        SELECT ?,path,sha256,size,content FROM archive_files WHERE version_id=?""",
                     (copy_id, version_id),
                 )
+                if job and job["state"] != "complete":
+                    # 迁移中的版本：未迁移的文件按源版本原件一并纳入副本
+                    conn.execute(
+                        """INSERT INTO copy_files(copy_id,path,sha256,size,content)
+                           SELECT ?,path,sha256,size,content FROM archive_files
+                           WHERE version_id=? AND path NOT IN (SELECT source_path FROM migration_records WHERE job_id=?)""",
+                        (copy_id, job["source_version_id"], job["id"]),
+                    )
+                # 新健康副本就位后版本不再视为降级
+                conn.execute("UPDATE archive_versions SET state='verified' WHERE id=? AND state='degraded'", (version_id,))
                 self._audit(conn, version["archive_id"], actor_id, "copy.create", {"copy_id": copy_id, "version_id": version_id, "location": location})
+                if job:
+                    self._refresh_job_state(conn, job, actor_id)
                 return {"id": copy_id, "version_id": version_id, "location": location, "state": "healthy"}
             except sqlite3.IntegrityError:
                 conn.rollback()
@@ -301,14 +349,41 @@ class PreservationStore:
             if not version:
                 raise BusinessError("档案版本不存在", 404, "not_found")
             self._access(conn, version["archive_id"], user)
-            files = conn.execute(
-                "SELECT path,sha256,size FROM archive_files WHERE version_id=? ORDER BY path", (version_id,)
-            ).fetchall()
+            files = [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT path,sha256,size FROM archive_files WHERE version_id=? ORDER BY path", (version_id,)
+                ).fetchall()
+            ]
             copies = conn.execute(
                 "SELECT id,location,state,last_verified_at FROM copies WHERE version_id=? ORDER BY id", (version_id,)
             ).fetchall()
             archive = conn.execute("SELECT * FROM archives WHERE id=?", (version["archive_id"],)).fetchone()
-            return {"version": dict(version), "archive": dict(archive), "files": [dict(x) for x in files], "copies": [dict(x) for x in copies]}
+            migration = None
+            job = conn.execute("SELECT * FROM migration_jobs WHERE target_version_id=?", (version_id,)).fetchone()
+            if job:
+                for item in files:
+                    item["migrated"] = True
+                if job["state"] != "complete":
+                    # 迁移未完成：未迁移的文件按源版本原件读回
+                    done = {
+                        row["source_path"]
+                        for row in conn.execute("SELECT source_path FROM migration_records WHERE job_id=?", (job["id"],)).fetchall()
+                    }
+                    for row in conn.execute(
+                        "SELECT path,sha256,size FROM archive_files WHERE version_id=? ORDER BY path", (job["source_version_id"],)
+                    ).fetchall():
+                        if row["path"] not in done:
+                            files.append({"path": row["path"], "sha256": row["sha256"], "size": row["size"],
+                                          "migrated": False, "origin": "source_version"})
+                    files.sort(key=lambda item: item["path"])
+                migration = self._job_view(conn, job["id"])
+            return {
+                "version": dict(version), "archive": dict(archive),
+                "files": files, "copies": [dict(x) for x in copies],
+                "migration_status": migration["state"] if migration else "unmigrated",
+                "migration": migration,
+            }
 
     def verify_copy(self, user_id: str, copy_id: int) -> dict:
         with self.connect() as conn:
@@ -340,9 +415,7 @@ class PreservationStore:
                             "SELECT path,sha256,size,content FROM copy_files WHERE copy_id=? ORDER BY path", (healthy["id"],)
                         ).fetchall()
                         donor_by_path = {r["path"]: r for r in donor}
-                        expected = {r["path"]: r for r in conn.execute(
-                            "SELECT path,sha256,size FROM archive_files WHERE version_id=?", (copy["version_id"],)
-                        ).fetchall()}
+                        expected = self._logical_manifest(conn, copy["version_id"])
                         if set(donor_by_path) == set(expected) and all(
                             hashlib.sha256(donor_by_path[p]["content"]).hexdigest() == expected[p]["sha256"] for p in expected
                         ):
@@ -356,6 +429,17 @@ class PreservationStore:
                             repaired, result_state = True, "healthy"
                     if result_state == "degraded":
                         conn.execute("UPDATE archive_versions SET state='degraded' WHERE id=?", (copy["version_id"],))
+                if result_state == "degraded":
+                    # 源版本改动（降级）：由它迁出的迁移任务一并失效，等待重新确认
+                    self._invalidate_derived_migrations(conn, copy["version_id"], user_id)
+                else:
+                    # 存在健康副本，版本不再视为降级
+                    conn.execute(
+                        "UPDATE archive_versions SET state='verified' WHERE id=? AND state='degraded'", (copy["version_id"],)
+                    )
+                job = conn.execute("SELECT * FROM migration_jobs WHERE target_version_id=?", (copy["version_id"],)).fetchone()
+                if job:
+                    self._refresh_job_state(conn, job, user_id)
                 self._audit(
                     conn, version["archive_id"], user_id, "copy.verify",
                     {"copy_id": copy_id, "state": result_state, "corrupt_paths": corrupt_paths, "repaired": repaired},
@@ -383,52 +467,209 @@ class PreservationStore:
             self._audit(conn, version["archive_id"], user_id, "copy.simulate_corruption", {"copy_id": copy_id, "path": path})
             return {"copy_id": copy_id, "path": path, "state": "corrupt"}
 
-    def migrate(self, actor_id: str, version_id: int, source_path: str, target_path: str, target_format: str, content_b64: str) -> dict:
+    def _logical_manifest(self, conn, version_id: int) -> dict:
+        """版本的逻辑清单：迁移中的版本还包含未迁移文件的源版本原件。"""
+        manifest = {
+            row["path"]: {"sha256": row["sha256"], "size": row["size"]}
+            for row in conn.execute("SELECT path,sha256,size FROM archive_files WHERE version_id=?", (version_id,)).fetchall()
+        }
+        job = conn.execute("SELECT * FROM migration_jobs WHERE target_version_id=?", (version_id,)).fetchone()
+        if job and job["state"] != "complete":
+            for row in conn.execute(
+                """SELECT path,sha256,size FROM archive_files WHERE version_id=?
+                   AND path NOT IN (SELECT source_path FROM migration_records WHERE job_id=?)""",
+                (job["source_version_id"], job["id"]),
+            ).fetchall():
+                manifest[row["path"]] = {"sha256": row["sha256"], "size": row["size"]}
+        return manifest
+
+    def _job_view(self, conn, job_id: int) -> dict:
+        job = conn.execute("SELECT * FROM migration_jobs WHERE id=?", (job_id,)).fetchone()
+        records = conn.execute("SELECT * FROM migration_records WHERE job_id=? ORDER BY id", (job_id,)).fetchall()
+        total = conn.execute(
+            "SELECT COUNT(*) FROM archive_files WHERE version_id=?", (job["source_version_id"],)
+        ).fetchone()[0]
+        copies = conn.execute(
+            "SELECT id,location,state,last_verified_at FROM copies WHERE version_id=? ORDER BY id", (job["target_version_id"],)
+        ).fetchall()
+        return {
+            "id": job["id"], "archive_id": job["archive_id"],
+            "source_version_id": job["source_version_id"], "target_version_id": job["target_version_id"],
+            "state": job["state"], "source_fingerprint": job["source_fingerprint"],
+            "created_by": job["created_by"], "created_at": job["created_at"], "updated_at": job["updated_at"],
+            "progress": {"total_files": total, "migrated_files": len(records)},
+            "records": [dict(r) for r in records],
+            "copies": [dict(c) for c in copies],
+        }
+
+    def _refresh_job_state(self, conn, job, actor_id: str) -> str:
+        """全部文件迁完、副本逐份校验通过且至少建好一个独立副本时，任务才算完整。"""
+        if job["state"] == "invalidated":
+            return "invalidated"
+        total = conn.execute(
+            "SELECT COUNT(*) FROM archive_files WHERE version_id=?", (job["source_version_id"],)
+        ).fetchone()[0]
+        done = conn.execute("SELECT COUNT(*) FROM migration_records WHERE job_id=?", (job["id"],)).fetchone()[0]
+        copies = conn.execute("SELECT state FROM copies WHERE version_id=?", (job["target_version_id"],)).fetchall()
+        complete = done >= total and bool(copies) and all(c["state"] == "healthy" for c in copies)
+        new_state = "complete" if complete else "migrating"
+        if new_state != job["state"]:
+            conn.execute("UPDATE migration_jobs SET state=?,updated_at=? WHERE id=?", (new_state, now(), job["id"]))
+            self._audit(
+                conn, job["archive_id"], actor_id,
+                "migration.complete" if new_state == "complete" else "migration.reopened",
+                {"job_id": job["id"], "target_version_id": job["target_version_id"],
+                 "migrated_files": done, "total_files": total},
+            )
+        return new_state
+
+    def _invalidate_derived_migrations(self, conn, source_version_id: int, actor_id: str) -> None:
+        """源版本改动（如降级）时，由它迁出的迁移任务一并失效，等待重新确认。"""
+        jobs = conn.execute(
+            "SELECT * FROM migration_jobs WHERE source_version_id=? AND state<>'invalidated'", (source_version_id,)
+        ).fetchall()
+        for job in jobs:
+            conn.execute("UPDATE migration_jobs SET state='invalidated',updated_at=? WHERE id=?", (now(), job["id"]))
+            self._audit(conn, job["archive_id"], actor_id, "migration.invalidated",
+                        {"job_id": job["id"], "target_version_id": job["target_version_id"], "reason": "source_version_changed"})
+
+    def start_migration(self, actor_id: str, version_id: int) -> dict:
+        """为源版本登记迁移任务并生成目标版本；同一源版本重复登记时返回已有任务和进度。"""
         with self.connect() as conn:
             actor = self._user(conn, actor_id, {"owner", "archivist"})
-            source_version = conn.execute("SELECT * FROM archive_versions WHERE id=?", (version_id,)).fetchone()
-            if not source_version:
-                raise BusinessError("源档案版本不存在", 404, "not_found")
-            self._access(conn, source_version["archive_id"], actor, require_write=True)
-            source = conn.execute(
-                "SELECT * FROM archive_files WHERE version_id=? AND path=?", (version_id, source_path)
-            ).fetchone()
+            source = conn.execute("SELECT * FROM archive_versions WHERE id=?", (version_id,)).fetchone()
             if not source:
-                raise BusinessError("源文件不存在", 404, "source_not_found")
-            converted = verify_manifest([{"path": target_path, "content_b64": content_b64}])[0]
+                raise BusinessError("源档案版本不存在", 404, "not_found")
+            self._access(conn, source["archive_id"], actor, require_write=True)
+            if source["state"] == "degraded":
+                raise BusinessError("源版本缺少健康副本，请先恢复再发起迁移", 409, "source_degraded")
             try:
                 conn.execute("BEGIN IMMEDIATE")
+                existing = conn.execute("SELECT id FROM migration_jobs WHERE source_version_id=?", (version_id,)).fetchone()
+                if existing:
+                    return self._job_view(conn, existing["id"]) | {"already_registered": True}
+                prior = conn.execute("SELECT state FROM migration_jobs WHERE target_version_id=?", (version_id,)).fetchone()
+                if prior and prior["state"] != "complete":
+                    raise BusinessError("该版本自身的迁移尚未完成，不能作为迁移源", 409, "source_still_migrating")
                 version_no = conn.execute(
-                    "SELECT COALESCE(MAX(version),0)+1 FROM archive_versions WHERE archive_id=?", (source_version["archive_id"],)
+                    "SELECT COALESCE(MAX(version),0)+1 FROM archive_versions WHERE archive_id=?", (source["archive_id"],)
                 ).fetchone()[0]
                 cur = conn.execute(
                     "INSERT INTO archive_versions(archive_id,version,created_by,created_at) VALUES(?,?,?,?)",
-                    (source_version["archive_id"], version_no, actor_id, now()),
+                    (source["archive_id"], version_no, actor_id, now()),
                 )
                 target_version_id = cur.lastrowid
-                conn.execute(
-                    """INSERT INTO archive_files(version_id,path,sha256,size,content)
-                       SELECT ?,path,sha256,size,content FROM archive_files
-                       WHERE version_id=? AND path<>?""",
-                    (target_version_id, version_id, source_path),
+                cur = conn.execute(
+                    """INSERT INTO migration_jobs(archive_id,source_version_id,target_version_id,source_fingerprint,created_by,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (source["archive_id"], version_id, target_version_id,
+                     _version_fingerprint(conn, version_id), actor_id, now(), now()),
                 )
-                conn.execute(
-                    "INSERT INTO archive_files(version_id,path,sha256,size,content) VALUES(?,?,?,?,?)",
-                    (target_version_id, converted["path"], converted["sha256"], converted["size"], converted["content"]),
-                )
-                conn.execute(
-                    "INSERT INTO migrations(source_version_id,target_version_id,source_path,target_path,target_format,actor_id,created_at) VALUES(?,?,?,?,?,?,?)",
-                    (version_id, target_version_id, source_path, converted["path"], target_format.strip(), actor_id, now()),
-                )
-                self._audit(
-                    conn, source_version["archive_id"], actor_id, "format.migrate",
-                    {"source_version_id": version_id, "target_version_id": target_version_id,
-                     "source_path": source_path, "target_path": converted["path"], "target_format": target_format.strip()},
-                )
-                return {"id": target_version_id, "version": version_no, "source_version_id": version_id, "target_path": converted["path"]}
+                job_id = cur.lastrowid
+                self._audit(conn, source["archive_id"], actor_id, "migration.start",
+                            {"job_id": job_id, "source_version_id": version_id, "target_version_id": target_version_id})
+                return self._job_view(conn, job_id) | {"already_registered": False}
             except Exception:
                 conn.rollback()
                 raise
+
+    def migrate_file(self, actor_id: str, job_id: int, source_path: str, target_path: str, target_format: str, content_b64: str) -> dict:
+        """把源版本的一个文件迁入目标版本；已完成的文件重复提交时跳过，不重写记录。"""
+        with self.connect() as conn:
+            actor = self._user(conn, actor_id, {"owner", "archivist"})
+            job = conn.execute("SELECT * FROM migration_jobs WHERE id=?", (job_id,)).fetchone()
+            if not job:
+                raise BusinessError("迁移任务不存在", 404, "not_found")
+            self._access(conn, job["archive_id"], actor, require_write=True)
+            if job["state"] == "invalidated":
+                raise BusinessError("源版本已改动，迁移失效，请先重新确认", 409, "migration_invalidated")
+            if job["state"] == "complete":
+                raise BusinessError("迁移已完成，不能再提交文件", 409, "migration_complete")
+            source = conn.execute(
+                "SELECT * FROM archive_files WHERE version_id=? AND path=?", (job["source_version_id"], source_path)
+            ).fetchone()
+            if not source:
+                raise BusinessError("源文件不存在", 404, "source_not_found")
+            if not target_format.strip():
+                raise BusinessError("target_format 不能为空", 422, "invalid_format")
+            converted = verify_manifest([{"path": target_path, "content_b64": content_b64}])[0]
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                existing = conn.execute(
+                    "SELECT * FROM migration_records WHERE job_id=? AND source_path=?", (job_id, source_path)
+                ).fetchone()
+                if existing:
+                    return dict(existing) | {"already_migrated": True, "job_state": job["state"]}
+                if conn.execute(
+                    "SELECT 1 FROM archive_files WHERE version_id=? AND path=?", (job["target_version_id"], converted["path"])
+                ).fetchone():
+                    raise BusinessError(f"目标路径已存在: {converted['path']}", 409, "target_path_conflict")
+                if converted["path"] != source_path and conn.execute(
+                    "SELECT 1 FROM archive_files WHERE version_id=? AND path=?", (job["source_version_id"], converted["path"])
+                ).fetchone():
+                    raise BusinessError(f"目标路径会遮蔽未迁移的源文件: {converted['path']}", 409, "target_path_conflict")
+                conn.execute(
+                    """INSERT INTO migration_records(job_id,source_path,target_path,target_format,sha256,size,actor_id,created_at)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (job_id, source_path, converted["path"], target_format.strip(),
+                     converted["sha256"], converted["size"], actor_id, now()),
+                )
+                conn.execute(
+                    "INSERT INTO archive_files(version_id,path,sha256,size,content) VALUES(?,?,?,?,?)",
+                    (job["target_version_id"], converted["path"], converted["sha256"], converted["size"], converted["content"]),
+                )
+                # 已建副本同步换入迁移后的文件，保持副本与逻辑视图一致
+                for copy in conn.execute("SELECT id FROM copies WHERE version_id=?", (job["target_version_id"],)).fetchall():
+                    conn.execute("DELETE FROM copy_files WHERE copy_id=? AND path=?", (copy["id"], source_path))
+                    conn.execute(
+                        "INSERT INTO copy_files(copy_id,path,sha256,size,content) VALUES(?,?,?,?,?)",
+                        (copy["id"], converted["path"], converted["sha256"], converted["size"], converted["content"]),
+                    )
+                self._audit(conn, job["archive_id"], actor_id, "migration.file",
+                            {"job_id": job_id, "source_path": source_path, "target_path": converted["path"],
+                             "target_format": target_format.strip(), "sha256": converted["sha256"]})
+                state = self._refresh_job_state(conn, job, actor_id)
+                record = conn.execute(
+                    "SELECT * FROM migration_records WHERE job_id=? AND source_path=?", (job_id, source_path)
+                ).fetchone()
+                return dict(record) | {"already_migrated": False, "job_state": state}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def confirm_migration(self, actor_id: str, job_id: int) -> dict:
+        """重新确认迁移任务：源版本指纹未变且拥有健康副本时，失效任务恢复为迁移中。"""
+        with self.connect() as conn:
+            actor = self._user(conn, actor_id, {"owner", "archivist"})
+            job = conn.execute("SELECT * FROM migration_jobs WHERE id=?", (job_id,)).fetchone()
+            if not job:
+                raise BusinessError("迁移任务不存在", 404, "not_found")
+            self._access(conn, job["archive_id"], actor, require_write=True)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                source = conn.execute("SELECT * FROM archive_versions WHERE id=?", (job["source_version_id"],)).fetchone()
+                if _version_fingerprint(conn, source["id"]) != job["source_fingerprint"]:
+                    raise BusinessError("源版本内容已变化，无法重新确认，请重新登记迁移", 409, "source_changed")
+                if source["state"] == "degraded":
+                    raise BusinessError("源版本缺少健康副本，请先恢复再重新确认", 409, "source_degraded")
+                if job["state"] == "invalidated":
+                    conn.execute("UPDATE migration_jobs SET state='migrating',updated_at=? WHERE id=?", (now(), job_id))
+                    self._audit(conn, job["archive_id"], actor_id, "migration.reconfirmed", {"job_id": job_id})
+                    job = conn.execute("SELECT * FROM migration_jobs WHERE id=?", (job_id,)).fetchone()
+                self._refresh_job_state(conn, job, actor_id)
+                return self._job_view(conn, job_id) | {"confirmed": True}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def get_migration(self, user_id: str, job_id: int) -> dict:
+        with self.connect() as conn:
+            user = self._user(conn, user_id, {"owner", "archivist", "auditor"})
+            job = conn.execute("SELECT * FROM migration_jobs WHERE id=?", (job_id,)).fetchone()
+            if not job:
+                raise BusinessError("迁移任务不存在", 404, "not_found")
+            self._access(conn, job["archive_id"], user)
+            return self._job_view(conn, job_id)
 
     def archive_status(self, user_id: str, archive_id: int) -> dict:
         with self.connect() as conn:
@@ -436,12 +677,17 @@ class PreservationStore:
             self._access(conn, archive_id, user)
             archive = conn.execute("SELECT * FROM archives WHERE id=?", (archive_id,)).fetchone()
             versions = conn.execute("SELECT id,version,state,created_at FROM archive_versions WHERE archive_id=? ORDER BY version", (archive_id,)).fetchall()
+            migration_states = {
+                row["target_version_id"]: row["state"]
+                for row in conn.execute("SELECT target_version_id,state FROM migration_jobs WHERE archive_id=?", (archive_id,)).fetchall()
+            }
             deadline = date.fromisoformat(archive["retention_until"])
             return {
                 "archive": dict(archive),
                 "days_remaining": (deadline - date.today()).days,
                 "versions": [dict(v) | {"file_count": conn.execute("SELECT COUNT(*) FROM archive_files WHERE version_id=?", (v["id"],)).fetchone()[0],
-                                         "copy_count": conn.execute("SELECT COUNT(*) FROM copies WHERE version_id=?", (v["id"],)).fetchone()[0]}
+                                         "copy_count": conn.execute("SELECT COUNT(*) FROM copies WHERE version_id=?", (v["id"],)).fetchone()[0],
+                                         "migration_status": migration_states.get(v["id"], "unmigrated")}
                              for v in versions],
                 "audit": [dict(r) | {"detail": json.loads(r["detail"])} for r in conn.execute("SELECT * FROM audit_log WHERE archive_id=? ORDER BY id", (archive_id,)).fetchall()],
             }
@@ -505,8 +751,16 @@ class Handler(BaseHTTPRequestHandler):
             d = self._body()
             return self._send(201, store.add_copy(user, int(parts[2]), d.get("location", "")))
         if len(parts) == 4 and parts[:2] == ["api", "versions"] and parts[3] == "migrate" and method == "POST":
+            result = store.start_migration(user, int(parts[2]))
+            return self._send(200 if result["already_registered"] else 201, result)
+        if len(parts) == 3 and parts[:2] == ["api", "migrations"] and method == "GET":
+            return self._send(200, store.get_migration(user, int(parts[2])))
+        if len(parts) == 4 and parts[:2] == ["api", "migrations"] and parts[3] == "files" and method == "POST":
             d = self._body()
-            return self._send(201, store.migrate(user, int(parts[2]), d.get("source_path", ""), d.get("target_path", ""), d.get("target_format", ""), d.get("content_b64", "")))
+            result = store.migrate_file(user, int(parts[2]), d.get("source_path", ""), d.get("target_path", ""), d.get("target_format", ""), d.get("content_b64", ""))
+            return self._send(200 if result["already_migrated"] else 201, result)
+        if len(parts) == 4 and parts[:2] == ["api", "migrations"] and parts[3] == "confirm" and method == "POST":
+            return self._send(200, store.confirm_migration(user, int(parts[2])))
         if len(parts) == 4 and parts[:2] == ["api", "copies"] and parts[3] == "verify" and method == "POST":
             return self._send(200, store.verify_copy(user, int(parts[2])))
         if len(parts) == 4 and parts[:2] == ["api", "copies"] and parts[3] == "simulate-corruption" and method == "POST":
